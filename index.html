@@ -1127,39 +1127,77 @@ Games.register({
   }
 });
 
-/* ========== GAME: Ludo ========== */
+/* ========== GAME: Ludo (Real Board Path) ========== */
 Games.register({
   id: 'ludo',
   name: 'Ludo',
   icon: '🎲',
-  tags: ['2P', 'Board'],
+  tags: ['2-4P', 'Board'],
   start(wrap) {
     let canvas = document.createElement('canvas');
     wrap.appendChild(canvas);
-    let ctx = canvas.getContext('2d');
-    let w, h, animId, running = false;
-    let phase = 'menu'; // menu | play | win
+    const ctx = canvas.getContext('2d');
+    let w, h, animId;
+    let phase = 'menu';
     let numPlayers = 2;
-    let current = 0; // player index
+    let current = 0;
     let dice = 1;
     let diceRolling = false;
     let canRoll = true;
-    let selectedToken = -1;
-    let winner = null;
+    let pending = null; // { roll, moves: [tokenIdx] }
     let message = '';
+    let tokens = []; // tokens[p][t] = { pos }
 
-    // Colors: Red, Green, Yellow, Blue
-    const COLORS = ['#ef4444', '#22c55e', '#eab308', '#3b82f6'];
-    const NAMES = ['Red', 'Green', 'Yellow', 'Blue'];
+    // Image layout: Red TL, Green TR, Blue BL, Yellow BR
+    const COLORS = ['#e53935', '#43a047', '#1e88e5', '#fdd835'];
+    const NAMES  = ['Red', 'Green', 'Blue', 'Yellow'];
 
-    // Board path: 52 main cells (index 0-51)
-    // Each player start index on main path
-    const START = [0, 13, 26, 39];
-    // Safe cells (cannot be captured)
+    // ---- 15×15 cell path (52 squares), clockwise ----
+    // Starts at Red entry (below red yard, going right along row 6 area)
+    // Coordinates: [col, row]  col→x  row→y   (0 = top-left)
+    const PATH = [
+      // Red entry → right along upper middle lane (row 6)
+      [1,6],[2,6],[3,6],[4,6],[5,6],
+      // up left arm to top
+      [6,5],[6,4],[6,3],[6,2],[6,1],[6,0],
+      // top row left→right
+      [7,0],
+      // down right of green
+      [8,0],[8,1],[8,2],[8,3],[8,4],[8,5],
+      // right along row 6
+      [9,6],[10,6],[11,6],[12,6],[13,6],[14,6],
+      // down right edge
+      [14,7],
+      // left along row 8
+      [14,8],[13,8],[12,8],[11,8],[10,8],[9,8],
+      // down toward yellow
+      [8,9],[8,10],[8,11],[8,12],[8,13],[8,14],
+      // bottom row right→left
+      [7,14],
+      // up left of yellow/blue
+      [6,14],[6,13],[6,12],[6,11],[6,10],[6,9],
+      // left along row 8
+      [5,8],[4,8],[3,8],[2,8],[1,8],[0,8],
+      // up left edge
+      [0,7],
+      // right along row 6 back toward red start
+      [0,6]
+    ];
+    // PATH length must be 52
+    // If short, pad (safety)
+    while (PATH.length < 52) PATH.push(PATH[PATH.length - 1]);
+    PATH.length = 52;
+
+    // Each player's start index on PATH (where token lands on a 6)
+    const START_IDX = [0, 13, 26, 39]; // Red, Green, Blue, Yellow
+
+    // Safe cells (global path index) — cannot capture
     const SAFE = new Set([0, 8, 13, 21, 26, 34, 39, 47]);
 
-    // tokens[player][token] = { pos: -1 home yard | 0-51 path | 100-105 home column | 999 finished }
-    let tokens = [];
+    // Home stretch length (colored path into center)
+    const HOME_LEN = 5; // need exact steps 1..5 then finish on 6th logical step → pos 999
+    // Player must travel DIST_TO_HOME steps on main path after entering, then home
+    const DIST_TO_HOME = 51; // full loop almost: enter at 0, after 51 moves reach home gate
 
     function resize() {
       w = canvas.width = wrap.clientWidth;
@@ -1168,164 +1206,172 @@ Games.register({
     resize();
     window.addEventListener('resize', resize);
 
+    function B() { return Math.min(w, h) * 0.9; } // board pixel size
+    function O() {
+      const s = B();
+      return { x: (w - s) / 2, y: (h - s) / 2 - 8 };
+    }
+    function cell() { return B() / 15; }
+
+    function cellCenter(gc, gr) {
+      const o = O(), c = cell();
+      return { x: o.x + gc * c + c / 2, y: o.y + gr * c + c / 2 };
+    }
+
+    // ---- token position helpers ----
+    // pos: -1 yard | 0..50 on path (steps from start) | 100..104 home | 999 done
+    function tokenXY(p, t) {
+      const tok = tokens[p][t];
+      if (tok.pos === -1) return yardXY(p, t);
+      if (tok.pos === 999) return cellCenter(7, 7);
+      if (tok.pos >= 100) {
+        // home column step 0..4
+        const step = tok.pos - 100;
+        return homeXY(p, step);
+      }
+      // main path: global index
+      const gIdx = (START_IDX[p] + tok.pos) % 52;
+      const [gc, gr] = PATH[gIdx];
+      return cellCenter(gc, gr);
+    }
+
+    function yardXY(p, t) {
+      // 2x2 inside each colored corner
+      const bases = [
+        { c: 1.5, r: 1.5 },  // Red TL
+        { c: 10.5, r: 1.5 }, // Green TR
+        { c: 1.5, r: 10.5 }, // Blue BL
+        { c: 10.5, r: 10.5 } // Yellow BR
+      ];
+      const b = bases[p];
+      const ox = (t % 2) * 1.3;
+      const oy = Math.floor(t / 2) * 1.3;
+      return cellCenter(b.c + ox, b.r + oy);
+    }
+
+    function homeXY(p, step) {
+      // step 0 (near path) → 4 (near center)
+      // Red: down from top into center (col 7, row 1→5)
+      // Green: left from right (row 7, col 13→9)
+      // Blue: up from bottom (col 7, row 13→9)
+      // Yellow: right from left — wait Yellow is BR so from bottom-right: left into center
+      // Actually from image:
+      // Green home stretch is vertical green cells top-center going down
+      // Red home is horizontal red cells left-center going right
+      // Blue home is vertical blue bottom-center going up
+      // Yellow home is horizontal yellow right-center going left
+      if (p === 0) return cellCenter(7, 1 + step);       // Red: top → center
+      if (p === 1) return cellCenter(13 - step, 7);     // Green: right → center
+      if (p === 2) return cellCenter(7, 13 - step);     // Blue: bottom → center
+      return cellCenter(1 + step, 7);                   // Yellow: left → center (for BR player path ends left side)
+    }
+
+    // Fix Yellow home: Yellow BR enters from bottom path going up left side of yellow...
+    // For START_IDX 39, after 51 steps enters yellow home from the bottom arm.
+    // Image shows yellow stretch horizontal on the right of center → going left.
+    // Override yellow:
+    // homeXY already: p===3 → leftward from right — good for yellow on right side.
+    // For blue BL vertical up — good.
+    // For green TR vertical — image has green vertical top — good with right→center.
+    // For red TL horizontal — image has red horizontal left — use row 7 going right:
+    function homeXYFixed(p, step) {
+      if (p === 0) return cellCenter(1 + step, 7);   // Red: left → center (matches image red row)
+      if (p === 1) return cellCenter(7, 1 + step);   // Green: top → center
+      if (p === 2) return cellCenter(7, 13 - step);  // Blue: bottom → center
+      return cellCenter(13 - step, 7);               // Yellow: right → center
+    }
+
+    // use fixed
+    const homeXY2 = homeXYFixed;
+
+    function tokenXY2(p, t) {
+      const tok = tokens[p][t];
+      if (tok.pos === -1) return yardXY(p, t);
+      if (tok.pos === 999) return cellCenter(7.5, 7.5);
+      if (tok.pos >= 100) return homeXY2(p, tok.pos - 100);
+      const gIdx = (START_IDX[p] + tok.pos) % 52;
+      const [gc, gr] = PATH[gIdx];
+      return cellCenter(gc, gr);
+    }
+
     function initTokens() {
       tokens = [];
       for (let p = 0; p < 4; p++) {
         tokens[p] = [];
-        for (let t = 0; t < 4; t++) {
-          tokens[p][t] = { pos: -1 }; // in yard
-        }
+        for (let t = 0; t < 4; t++) tokens[p].push({ pos: -1 });
       }
     }
 
-    function boardSize() {
-      return Math.min(w, h) * 0.92;
-    }
-    function boardOrigin() {
-      const s = boardSize();
-      return { x: (w - s) / 2, y: (h - s) / 2 };
-    }
-
-    // Convert main path index (0-51) to board pixel
-    function pathToXY(idx) {
-      const s = boardSize();
-      const o = boardOrigin();
-      const cell = s / 15;
-      // Classic Ludo path layout on 15x15 grid
-      // Bottom row going left-to-right near red home: simplified ring
-      const coords = buildPathCoords(cell, o);
-      return coords[idx % 52];
-    }
-
-    function buildPathCoords(cell, o) {
-      const pts = [];
-      // Bottom arm (left to right) y = 8*cell area — simplified square path
-      // Outer track: 52 cells around
-      // Top row (left→right): y index 6
-      for (let i = 0; i < 6; i++) pts.push({ x: o.x + (6 + i) * cell + cell / 2, y: o.y + 6 * cell + cell / 2 });
-      // Right column (top→bottom)
-      for (let i = 0; i < 6; i++) pts.push({ x: o.x + 12 * cell + cell / 2, y: o.y + (6 + i) * cell + cell / 2 });
-      // extra corner
-      pts.push({ x: o.x + 13 * cell + cell / 2, y: o.y + 12 * cell + cell / 2 });
-      // Bottom row (right→left)
-      for (let i = 0; i < 6; i++) pts.push({ x: o.x + (12 - i) * cell + cell / 2, y: o.y + 12 * cell + cell / 2 });
-      // Left column bottom part
-      for (let i = 0; i < 2; i++) pts.push({ x: o.x + 6 * cell + cell / 2, y: o.y + (13 + i) * cell + cell / 2 });
-      // Bottom left stretch
-      for (let i = 0; i < 6; i++) pts.push({ x: o.x + (6 - i) * cell + cell / 2, y: o.y + 14 * cell + cell / 2 });
-      // Left column (bottom→top)
-      for (let i = 0; i < 6; i++) pts.push({ x: o.x + 0 * cell + cell / 2, y: o.y + (12 - i) * cell + cell / 2 });
-      pts.push({ x: o.x + 0 * cell + cell / 2, y: o.y + 6 * cell + cell / 2 });
-      // Top row left part (left→right remaining)
-      for (let i = 0; i < 5; i++) pts.push({ x: o.x + (1 + i) * cell + cell / 2, y: o.y + 6 * cell + cell / 2 });
-      // Fill to 52 if short
-      while (pts.length < 52) {
-        pts.push(pts[pts.length - 1] || { x: o.x + s / 2, y: o.y + s / 2 });
-      }
-      return pts.slice(0, 52);
-    }
-
-    // Home column positions (6 cells into center for each player)
-    function homeColXY(player, step) {
-      // step 0-5
-      const s = boardSize();
-      const o = boardOrigin();
-      const cell = s / 15;
-      const cx = o.x + 7.5 * cell;
-      const cy = o.y + 7.5 * cell;
-      if (player === 0) return { x: cx, y: o.y + (13 - step) * cell + cell / 2 }; // red from bottom
-      if (player === 1) return { x: o.x + (1 + step) * cell + cell / 2, y: cy }; // green from left
-      if (player === 2) return { x: cx, y: o.y + (1 + step) * cell + cell / 2 }; // yellow from top
-      return { x: o.x + (13 - step) * cell + cell / 2, y: cy }; // blue from right
-    }
-
-    function yardXY(player, tokenIdx) {
-      const s = boardSize();
-      const o = boardOrigin();
-      const cell = s / 15;
-      const bases = [
-        { x: 1.5, y: 10.5 }, // red bottom-left
-        { x: 1.5, y: 1.5 },  // green top-left
-        { x: 10.5, y: 1.5 }, // yellow top-right
-        { x: 10.5, y: 10.5 } // blue bottom-right
-      ];
-      const b = bases[player];
-      const ox = (tokenIdx % 2) * 1.2;
-      const oy = Math.floor(tokenIdx / 2) * 1.2;
-      return {
-        x: o.x + (b.x + ox) * cell + cell / 2,
-        y: o.y + (b.y + oy) * cell + cell / 2
-      };
-    }
-
-    function tokenPixel(p, t) {
-      const tok = tokens[p][t];
-      if (tok.pos === -1) return yardXY(p, t);
-      if (tok.pos >= 100 && tok.pos < 106) return homeColXY(p, tok.pos - 100);
-      if (tok.pos === 999) {
-        const s = boardSize();
-        const o = boardOrigin();
-        return { x: o.x + boardSize() / 2, y: o.y + boardSize() / 2 };
-      }
-      // main path: map player-relative to global
-      const global = (START[p] + tok.pos) % 52;
-      return pathToXY(global);
-    }
-
-    function movableTokens(player, roll) {
+    function movable(p, roll) {
       const list = [];
       for (let t = 0; t < 4; t++) {
-        const pos = tokens[player][t].pos;
+        const pos = tokens[p][t].pos;
         if (pos === 999) continue;
         if (pos === -1) {
           if (roll === 6) list.push(t);
-        } else if (pos >= 100) {
-          // home column
+          continue;
+        }
+        if (pos >= 100) {
+          // home: need exact to finish
           const step = pos - 100;
-          if (step + roll <= 5) list.push(t);
-        } else {
-          // on path
-          const next = pos + roll;
-          if (next < 51) list.push(t);
-          else if (next === 51) list.push(t); // enter home stretch start
-          else if (next > 51 && next <= 56) list.push(t); // can enter home
+          const need = HOME_LEN - step; // steps left to finish (5 cells, finish when step becomes 5 → 999)
+          if (roll === need) list.push(t);          // exact finish
+          else if (roll < need) list.push(t);       // move forward in home
+          continue;
+        }
+        // on main path
+        const next = pos + roll;
+        if (next < DIST_TO_HOME) list.push(t);
+        else if (next === DIST_TO_HOME) list.push(t); // land on gate
+        else {
+          // overshoot into home?
+          const into = next - DIST_TO_HOME; // 1..5+
+          if (into <= HOME_LEN) list.push(t);
         }
       }
       return list;
     }
 
-    function moveToken(player, tIdx, roll) {
-      const tok = tokens[player][tIdx];
+    function doMove(p, t, roll) {
+      const tok = tokens[p][t];
       if (tok.pos === -1 && roll === 6) {
-        tok.pos = 0; // enter board at start
-      } else if (tok.pos >= 0 && tok.pos < 51) {
-        let next = tok.pos + roll;
-        if (next < 51) {
+        tok.pos = 0;
+      } else if (tok.pos >= 100) {
+        const step = tok.pos - 100;
+        if (step + roll >= HOME_LEN) tok.pos = 999;
+        else tok.pos = 100 + step + roll;
+      } else {
+        const next = tok.pos + roll;
+        if (next < DIST_TO_HOME) {
           tok.pos = next;
-        } else {
-          // enter home column
-          const over = next - 51;
-          tok.pos = 100 + over;
-          if (tok.pos > 105) tok.pos = 999;
+        } else if (next === DIST_TO_HOME) {
+          tok.pos = DIST_TO_HOME; // on gate — next rolls enter home
+          // actually gate is last path cell; entering home starts at 100
+          // treat DIST_TO_HOME as last path; any further goes home
+          tok.pos = DIST_TO_HOME;
         }
-      } else if (tok.pos >= 100 && tok.pos <= 105) {
-        tok.pos += roll;
-        if (tok.pos > 105) tok.pos = 999;
+        if (next > DIST_TO_HOME) {
+          const into = next - DIST_TO_HOME - 1; // 0-based home step
+          if (into >= HOME_LEN) tok.pos = 999;
+          else tok.pos = 100 + into;
+        } else if (next === DIST_TO_HOME) {
+          tok.pos = DIST_TO_HOME;
+        }
       }
 
-      // capture check (only on main path)
-      if (tok.pos >= 0 && tok.pos < 51) {
-        const global = (START[player] + tok.pos) % 52;
-        if (!SAFE.has(global)) {
+      // Capture on main path only
+      if (tok.pos >= 0 && tok.pos < DIST_TO_HOME) {
+        const gIdx = (START_IDX[p] + tok.pos) % 52;
+        if (!SAFE.has(gIdx)) {
           for (let op = 0; op < numPlayers; op++) {
-            if (op === player) continue;
+            if (op === p) continue;
             for (let ot = 0; ot < 4; ot++) {
-              const opp = tokens[op][ot];
-              if (opp.pos >= 0 && opp.pos < 51) {
-                const og = (START[op] + opp.pos) % 52;
-                if (og === global) {
-                  opp.pos = -1; // send home
-                  message = NAMES[op] + ' captured!';
+              const opos = tokens[op][ot].pos;
+              if (opos >= 0 && opos < DIST_TO_HOME) {
+                const og = (START_IDX[op] + opos) % 52;
+                if (og === gIdx) {
+                  tokens[op][ot].pos = -1;
+                  message = NAMES[op] + ' sent home!';
                 }
               }
             }
@@ -1333,89 +1379,77 @@ Games.register({
         }
       }
 
-      // win check
-      if (tokens[player].every(t => t.pos === 999)) {
-        winner = player;
+      // Win
+      if (tokens[p].every(x => x.pos === 999)) {
         phase = 'win';
-        running = false;
-        Hub.setScore(NAMES[player] + ' wins!');
+        Hub.setScore(NAMES[p] + ' wins!');
         Hub.showOverlay(
-          `<h2>${NAMES[player]} Wins!</h2><button class="btn-play" id="go">PLAY AGAIN</button>`
+          `<h2>${NAMES[p]} Wins!</h2><button class="btn-play" id="go">PLAY AGAIN</button>`
         );
-        document.getElementById('go').onclick = () => showMenu();
+        document.getElementById('go').onclick = showMenu;
       }
     }
 
-    function nextTurn(extra) {
-      selectedToken = -1;
-      if (extra) {
+    function nextTurn(extraSix) {
+      pending = null;
+      if (extraSix) {
         canRoll = true;
-        message = NAMES[current] + ' rolls again (6)';
+        message = NAMES[current] + ' — roll again (6)!';
+        Hub.setScore(NAMES[current] + ' · 6!');
         return;
       }
       current = (current + 1) % numPlayers;
       canRoll = true;
-      message = NAMES[current] + "'s turn — roll dice";
+      message = NAMES[current] + "'s turn — roll";
       Hub.setScore(NAMES[current] + ' · Roll');
+    }
+
+    function onDice(roll) {
+      const moves = movable(current, roll);
+      if (moves.length === 0) {
+        message = 'No move';
+        setTimeout(() => nextTurn(false), 600);
+        return;
+      }
+      if (moves.length === 1) {
+        doMove(current, moves[0], roll);
+        if (phase === 'win') return;
+        nextTurn(roll === 6);
+      } else {
+        pending = { roll, moves };
+        message = 'Tap your token (' + roll + ')';
+      }
     }
 
     function rollDice() {
       if (!canRoll || diceRolling || phase !== 'play') return;
-      diceRolling = true;
       canRoll = false;
+      diceRolling = true;
       let n = 0;
       const iv = setInterval(() => {
         dice = 1 + Math.floor(Math.random() * 6);
         n++;
-        if (n > 10) {
+        if (n > 12) {
           clearInterval(iv);
           diceRolling = false;
-          onDiceResult(dice);
+          onDice(dice);
         }
-      }, 60);
-    }
-
-    function onDiceResult(roll) {
-      const moves = movableTokens(current, roll);
-      if (moves.length === 0) {
-        message = 'No moves — next player';
-        setTimeout(() => nextTurn(false), 700);
-        return;
-      }
-      if (moves.length === 1) {
-        moveToken(current, moves[0], roll);
-        nextTurn(roll === 6);
-      } else {
-        selectedToken = -1;
-        message = 'Tap a token to move (' + roll + ')';
-        // store pending roll
-        window._ludoPending = { roll, moves };
-      }
-    }
-
-    function trySelectToken(p, t) {
-      if (phase !== 'play' || p !== current) return;
-      const pending = window._ludoPending;
-      if (!pending) return;
-      if (!pending.moves.includes(t)) return;
-      moveToken(p, t, pending.roll);
-      window._ludoPending = null;
-      nextTurn(pending.roll === 6);
+      }, 50);
     }
 
     function showMenu() {
       phase = 'menu';
-      winner = null;
+      pending = null;
       message = '';
-      window._ludoPending = null;
+      Hub.hidePads();
       Hub.setScore('Ludo');
       Hub.showOverlay(`
         <h2>Ludo</h2>
-        <p>Select players</p>
-        <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin:12px 0">
-          <button class="btn-play" id="p2" style="min-width:80px">2P</button>
-          <button class="btn-play" id="p3" style="min-width:80px">3P</button>
-          <button class="btn-play" id="p4" style="min-width:80px">4P</button>
+        <p>Real path · Full board</p>
+        <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-top:12px">
+          <button class="btn-play" id="p2">2P</button>
+          <button class="btn-play" id="p3">3P</button>
+          <button class="btn-play" id="p4">4P</button>
         </div>
       `);
       document.getElementById('p2').onclick = () => startGame(2);
@@ -1429,10 +1463,9 @@ Games.register({
       current = 0;
       dice = 1;
       canRoll = true;
-      selectedToken = -1;
+      pending = null;
       phase = 'play';
-      running = true;
-      message = NAMES[0] + "'s turn — roll dice";
+      message = NAMES[0] + "'s turn — roll";
       Hub.hideOverlay();
       Hub.setScore(NAMES[0] + ' · Roll');
       Hub.showPads({
@@ -1441,178 +1474,247 @@ Games.register({
       });
     }
 
-    // Input
-    let spaceWas = false;
+    // Pointer
     canvas.addEventListener('pointerdown', e => {
-      e.preventDefault();
       if (phase !== 'play') return;
+      e.preventDefault();
       const rect = canvas.getBoundingClientRect();
       const mx = (e.clientX - rect.left) * (canvas.width / rect.width);
       const my = (e.clientY - rect.top) * (canvas.height / rect.height);
 
-      // dice button area (bottom center)
-      const s = boardSize();
-      const o = boardOrigin();
-      const diceX = o.x + s / 2;
-      const diceY = o.y + s + 8;
-      if (Math.hypot(mx - diceX, my - (Math.min(h - 30, diceY))) < 36) {
+      // dice hit
+      const o = O(), s = B();
+      const dx = o.x + s / 2;
+      const dy = Math.min(h - 26, o.y + s + 22);
+      if (Math.hypot(mx - dx, my - dy) < 40) {
         rollDice();
         return;
       }
 
-      // token hit
-      for (let p = 0; p < numPlayers; p++) {
-        for (let t = 0; t < 4; t++) {
-          const pt = tokenPixel(p, t);
-          if (Math.hypot(mx - pt.x, my - pt.y) < boardSize() / 30) {
-            trySelectToken(p, t);
-            return;
-          }
+      // token select
+      if (!pending) return;
+      for (const t of pending.moves) {
+        const pt = tokenXY2(current, t);
+        if (Math.hypot(mx - pt.x, my - pt.y) < cell() * 0.55) {
+          doMove(current, t, pending.roll);
+          const six = pending.roll === 6;
+          pending = null;
+          if (phase !== 'win') nextTurn(six);
+          return;
         }
       }
     });
 
-    function loop() {
-      animId = requestAnimationFrame(loop);
-      // virtual roll button
-      const spaceNow = typeof Input !== 'undefined' && Input.on('Space');
-      if (spaceNow && !spaceWas) rollDice();
-      spaceWas = spaceNow;
+    // ---- DRAW ----
+    function drawBoard() {
+      const o = O(), s = B(), c = cell();
 
-      ctx.fillStyle = '#0a0a12';
-      ctx.fillRect(0, 0, w, h);
-      if (phase === 'menu') return;
-
-      const s = boardSize();
-      const o = boardOrigin();
-      const cell = s / 15;
-
-      // board background
-      ctx.fillStyle = '#1a1a28';
-      roundRect(ctx, o.x, o.y, s, s, 8);
+      // outer border
+      ctx.fillStyle = '#111';
+      roundRect(ctx, o.x - 3, o.y - 3, s + 6, s + 6, 6);
       ctx.fill();
 
-      // 4 home yards
+      // 4 yards (match image)
       const yards = [
-        { x: 0, y: 9, c: COLORS[0] },
-        { x: 0, y: 0, c: COLORS[1] },
-        { x: 9, y: 0, c: COLORS[2] },
-        { x: 9, y: 9, c: COLORS[3] }
+        { x: 0, y: 0, col: COLORS[0] }, // Red TL
+        { x: 9, y: 0, col: COLORS[1] }, // Green TR
+        { x: 0, y: 9, col: COLORS[2] }, // Blue BL
+        { x: 9, y: 9, col: COLORS[3] }  // Yellow BR
       ];
       yards.forEach((y, i) => {
-        if (i >= numPlayers) {
-          ctx.fillStyle = '#222230';
-        } else {
-          ctx.fillStyle = y.c + '44';
-        }
-        ctx.fillRect(o.x + y.x * cell, o.y + y.y * cell, 6 * cell, 6 * cell);
-        ctx.strokeStyle = i < numPlayers ? y.c : '#333';
-        ctx.lineWidth = 2;
-        ctx.strokeRect(o.x + y.x * cell + 2, o.y + y.y * cell + 2, 6 * cell - 4, 6 * cell - 4);
-      });
-
-      // center cross paths (light)
-      ctx.fillStyle = '#2a2a3a';
-      ctx.fillRect(o.x + 6 * cell, o.y, 3 * cell, s);
-      ctx.fillRect(o.x, o.y + 6 * cell, s, 3 * cell);
-
-      // colored home columns
-      const hc = [
-        { x: 7, y: 9, w: 1, h: 6, c: COLORS[0] },
-        { x: 1, y: 7, w: 6, h: 1, c: COLORS[1] },
-        { x: 7, y: 1, w: 1, h: 6, c: COLORS[2] },
-        { x: 9, y: 7, w: 6, h: 1, c: COLORS[3] }
-      ];
-      hc.forEach((c, i) => {
+        ctx.fillStyle = y.col;
+        ctx.fillRect(o.x + y.x * c, o.y + y.y * c, 6 * c, 6 * c);
+        // inner white diamond area
+        ctx.fillStyle = '#fff';
+        ctx.beginPath();
+        const cx = o.x + (y.x + 3) * c;
+        const cy = o.y + (y.y + 3) * c;
+        ctx.moveTo(cx, cy - 2.2 * c);
+        ctx.lineTo(cx + 2.2 * c, cy);
+        ctx.lineTo(cx, cy + 2.2 * c);
+        ctx.lineTo(cx - 2.2 * c, cy);
+        ctx.closePath();
+        ctx.fill();
+        // 4 token slots circles
         if (i < numPlayers) {
-          ctx.fillStyle = c.c + '66';
-          ctx.fillRect(o.x + c.x * cell, o.y + c.y * cell, c.w * cell, c.h * cell);
+          ctx.fillStyle = y.col;
+          [[-0.9, -0.9], [0.9, -0.9], [-0.9, 0.9], [0.9, 0.9]].forEach(([dx, dy]) => {
+            ctx.beginPath();
+            ctx.arc(cx + dx * c, cy + dy * c, c * 0.35, 0, Math.PI * 2);
+            ctx.fill();
+          });
         }
       });
 
-      // center triangle / home
-      ctx.fillStyle = '#111118';
+      // white cross paths
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(o.x + 6 * c, o.y, 3 * c, s);
+      ctx.fillRect(o.x, o.y + 6 * c, s, 3 * c);
+
+      // colored home stretches (match image)
+      // Red horizontal left→center (row 7)
+      ctx.fillStyle = COLORS[0];
+      for (let i = 1; i <= 5; i++) ctx.fillRect(o.x + i * c, o.y + 7 * c, c, c);
+      // Green vertical top→center (col 7)
+      ctx.fillStyle = COLORS[1];
+      for (let i = 1; i <= 5; i++) ctx.fillRect(o.x + 7 * c, o.y + i * c, c, c);
+      // Blue vertical bottom→center (col 7)
+      ctx.fillStyle = COLORS[2];
+      for (let i = 9; i <= 13; i++) ctx.fillRect(o.x + 7 * c, o.y + i * c, c, c);
+      // Yellow horizontal right→center (row 7)
+      ctx.fillStyle = COLORS[3];
+      for (let i = 9; i <= 13; i++) ctx.fillRect(o.x + i * c, o.y + 7 * c, c, c);
+
+      // center triangles
+      const m = o.x + 7.5 * c, n = o.y + 7.5 * c;
+      const tri = [
+        [COLORS[0], m, n, o.x + 6 * c, o.y + 6 * c, o.x + 6 * c, o.y + 9 * c],
+        [COLORS[1], m, n, o.x + 6 * c, o.y + 6 * c, o.x + 9 * c, o.y + 6 * c],
+        [COLORS[2], m, n, o.x + 6 * c, o.y + 9 * c, o.x + 9 * c, o.y + 9 * c],
+        [COLORS[3], m, n, o.x + 9 * c, o.y + 6 * c, o.x + 9 * c, o.y + 9 * c]
+      ];
+      // Image: top-left red, top-right green, bottom-left blue, bottom-right yellow
       ctx.beginPath();
-      ctx.moveTo(o.x + 6 * cell, o.y + 6 * cell);
-      ctx.lineTo(o.x + 9 * cell, o.y + 6 * cell);
-      ctx.lineTo(o.x + 9 * cell, o.y + 9 * cell);
-      ctx.lineTo(o.x + 6 * cell, o.y + 9 * cell);
+      ctx.moveTo(o.x + 6 * c, o.y + 6 * c);
+      ctx.lineTo(o.x + 9 * c, o.y + 6 * c);
+      ctx.lineTo(m, n);
       ctx.closePath();
+      ctx.fillStyle = COLORS[1]; // green top
+      ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(o.x + 9 * c, o.y + 6 * c);
+      ctx.lineTo(o.x + 9 * c, o.y + 9 * c);
+      ctx.lineTo(m, n);
+      ctx.closePath();
+      ctx.fillStyle = COLORS[3];
+      ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(o.x + 9 * c, o.y + 9 * c);
+      ctx.lineTo(o.x + 6 * c, o.y + 9 * c);
+      ctx.lineTo(m, n);
+      ctx.closePath();
+      ctx.fillStyle = COLORS[2];
+      ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(o.x + 6 * c, o.y + 9 * c);
+      ctx.lineTo(o.x + 6 * c, o.y + 6 * c);
+      ctx.lineTo(m, n);
+      ctx.closePath();
+      ctx.fillStyle = COLORS[0];
       ctx.fill();
 
-      // grid lines subtle
-      ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+      // grid lines on path only (subtle)
+      ctx.strokeStyle = 'rgba(0,0,0,0.12)';
       ctx.lineWidth = 1;
       for (let i = 0; i <= 15; i++) {
         ctx.beginPath();
-        ctx.moveTo(o.x + i * cell, o.y);
-        ctx.lineTo(o.x + i * cell, o.y + s);
+        ctx.moveTo(o.x + i * c, o.y);
+        ctx.lineTo(o.x + i * c, o.y + s);
         ctx.stroke();
         ctx.beginPath();
-        ctx.moveTo(o.x, o.y + i * cell);
-        ctx.lineTo(o.x + s, o.y + i * cell);
+        ctx.moveTo(o.x, o.y + i * c);
+        ctx.lineTo(o.x + s, o.y + i * c);
         ctx.stroke();
       }
 
-      // path dots
-      for (let i = 0; i < 52; i++) {
-        const pt = pathToXY(i);
-        ctx.fillStyle = SAFE.has(i) ? 'rgba(255,255,255,0.25)' : 'rgba(255,255,255,0.08)';
+      // start arrows / safe markers on path
+      PATH.forEach((_, i) => {
+        if (!SAFE.has(i)) return;
+        const [gc, gr] = PATH[i];
+        const pt = cellCenter(gc, gr);
+        ctx.fillStyle = 'rgba(0,0,0,0.15)';
         ctx.beginPath();
-        ctx.arc(pt.x, pt.y, cell * 0.2, 0, Math.PI * 2);
+        ctx.arc(pt.x, pt.y, c * 0.15, 0, Math.PI * 2);
         ctx.fill();
-      }
+      });
+    }
 
-      // tokens
+    function drawTokens() {
+      const c = cell();
       for (let p = 0; p < numPlayers; p++) {
         for (let t = 0; t < 4; t++) {
-          const pt = tokenPixel(p, t);
-          const r = cell * 0.32;
+          const pt = tokenXY2(p, t);
+          const r = c * 0.36;
+          // highlight movable
+          const can = pending && pending.moves.includes(t) && p === current;
+          if (can) {
+            ctx.beginPath();
+            ctx.arc(pt.x, pt.y, r + 5, 0, Math.PI * 2);
+            ctx.strokeStyle = '#fff';
+            ctx.lineWidth = 3;
+            ctx.stroke();
+          }
           ctx.beginPath();
           ctx.arc(pt.x, pt.y, r, 0, Math.PI * 2);
           ctx.fillStyle = COLORS[p];
           ctx.shadowColor = COLORS[p];
-          ctx.shadowBlur = 8;
+          ctx.shadowBlur = 6;
           ctx.fill();
           ctx.shadowBlur = 0;
           ctx.strokeStyle = '#fff';
-          ctx.lineWidth = 2;
+          ctx.lineWidth = 2.5;
           ctx.stroke();
-          // number
           ctx.fillStyle = '#fff';
-          ctx.font = 'bold ' + Math.floor(r) + 'px sans-serif';
+          ctx.font = 'bold ' + Math.floor(r * 0.9) + 'px sans-serif';
           ctx.textAlign = 'center';
           ctx.textBaseline = 'middle';
           ctx.fillText(String(t + 1), pt.x, pt.y + 1);
         }
       }
+    }
 
-      // dice
-      const diceX = o.x + s / 2;
-      const diceY = Math.min(h - 28, o.y + s + 24);
+    function drawDice() {
+      const o = O(), s = B();
+      const dx = o.x + s / 2;
+      const dy = Math.min(h - 26, o.y + s + 22);
       ctx.fillStyle = '#fff';
-      ctx.shadowColor = '#22d3ee';
-      ctx.shadowBlur = canRoll ? 12 : 0;
-      roundRect(ctx, diceX - 22, diceY - 22, 44, 44, 8);
+      ctx.shadowColor = canRoll ? '#22d3ee' : 'transparent';
+      ctx.shadowBlur = canRoll ? 14 : 0;
+      roundRect(ctx, dx - 24, dy - 24, 48, 48, 10);
       ctx.fill();
       ctx.shadowBlur = 0;
+      // pips
       ctx.fillStyle = '#111';
-      ctx.font = 'bold 22px sans-serif';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(String(dice), diceX, diceY);
+      const pip = (px, py) => {
+        ctx.beginPath();
+        ctx.arc(dx + px, dy + py, 3.5, 0, Math.PI * 2);
+        ctx.fill();
+      };
+      const map = {
+        1: [[0, 0]],
+        2: [[-8, -8], [8, 8]],
+        3: [[-8, -8], [0, 0], [8, 8]],
+        4: [[-8, -8], [8, -8], [-8, 8], [8, 8]],
+        5: [[-8, -8], [8, -8], [0, 0], [-8, 8], [8, 8]],
+        6: [[-8, -8], [8, -8], [-8, 0], [8, 0], [-8, 8], [8, 8]]
+      };
+      (map[dice] || []).forEach(([x, y]) => pip(x, y));
+    }
+
+    function loop() {
+      animId = requestAnimationFrame(loop);
+      if (typeof Input !== 'undefined' && Input.on('Space')) {
+        if (canRoll && !diceRolling) rollDice();
+      }
+      ctx.fillStyle = '#0a0a12';
+      ctx.fillRect(0, 0, w, h);
+      if (phase === 'menu') return;
+
+      drawBoard();
+      drawTokens();
+      drawDice();
 
       // message
-      ctx.fillStyle = '#94a3b8';
-      ctx.font = '13px sans-serif';
+      ctx.fillStyle = '#cbd5e1';
+      ctx.font = '13px system-ui,sans-serif';
       ctx.textAlign = 'center';
-      ctx.fillText(message || '', w / 2, 18);
+      ctx.fillText(message, w / 2, 16);
 
-      // current player indicator
+      // current color dot
       if (phase === 'play') {
         ctx.fillStyle = COLORS[current];
         ctx.beginPath();
-        ctx.arc(16, 18, 8, 0, Math.PI * 2);
+        ctx.arc(14, 16, 7, 0, Math.PI * 2);
         ctx.fill();
       }
     }
@@ -1631,11 +1733,9 @@ Games.register({
     loop();
 
     this._cleanup = () => {
-      running = false;
       cancelAnimationFrame(animId);
       window.removeEventListener('resize', resize);
       if (typeof Hub !== 'undefined') Hub.hidePads();
-      window._ludoPending = null;
     };
   },
   stop() {
