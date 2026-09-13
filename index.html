@@ -1127,6 +1127,522 @@ Games.register({
   }
 });
 
+/* ========== GAME: Ludo ========== */
+Games.register({
+  id: 'ludo',
+  name: 'Ludo',
+  icon: '🎲',
+  tags: ['2P', 'Board'],
+  start(wrap) {
+    let canvas = document.createElement('canvas');
+    wrap.appendChild(canvas);
+    let ctx = canvas.getContext('2d');
+    let w, h, animId, running = false;
+    let phase = 'menu'; // menu | play | win
+    let numPlayers = 2;
+    let current = 0; // player index
+    let dice = 1;
+    let diceRolling = false;
+    let canRoll = true;
+    let selectedToken = -1;
+    let winner = null;
+    let message = '';
+
+    // Colors: Red, Green, Yellow, Blue
+    const COLORS = ['#ef4444', '#22c55e', '#eab308', '#3b82f6'];
+    const NAMES = ['Red', 'Green', 'Yellow', 'Blue'];
+
+    // Board path: 52 main cells (index 0-51)
+    // Each player start index on main path
+    const START = [0, 13, 26, 39];
+    // Safe cells (cannot be captured)
+    const SAFE = new Set([0, 8, 13, 21, 26, 34, 39, 47]);
+
+    // tokens[player][token] = { pos: -1 home yard | 0-51 path | 100-105 home column | 999 finished }
+    let tokens = [];
+
+    function resize() {
+      w = canvas.width = wrap.clientWidth;
+      h = canvas.height = wrap.clientHeight;
+    }
+    resize();
+    window.addEventListener('resize', resize);
+
+    function initTokens() {
+      tokens = [];
+      for (let p = 0; p < 4; p++) {
+        tokens[p] = [];
+        for (let t = 0; t < 4; t++) {
+          tokens[p][t] = { pos: -1 }; // in yard
+        }
+      }
+    }
+
+    function boardSize() {
+      return Math.min(w, h) * 0.92;
+    }
+    function boardOrigin() {
+      const s = boardSize();
+      return { x: (w - s) / 2, y: (h - s) / 2 };
+    }
+
+    // Convert main path index (0-51) to board pixel
+    function pathToXY(idx) {
+      const s = boardSize();
+      const o = boardOrigin();
+      const cell = s / 15;
+      // Classic Ludo path layout on 15x15 grid
+      // Bottom row going left-to-right near red home: simplified ring
+      const coords = buildPathCoords(cell, o);
+      return coords[idx % 52];
+    }
+
+    function buildPathCoords(cell, o) {
+      const pts = [];
+      // Bottom arm (left to right) y = 8*cell area — simplified square path
+      // Outer track: 52 cells around
+      // Top row (left→right): y index 6
+      for (let i = 0; i < 6; i++) pts.push({ x: o.x + (6 + i) * cell + cell / 2, y: o.y + 6 * cell + cell / 2 });
+      // Right column (top→bottom)
+      for (let i = 0; i < 6; i++) pts.push({ x: o.x + 12 * cell + cell / 2, y: o.y + (6 + i) * cell + cell / 2 });
+      // extra corner
+      pts.push({ x: o.x + 13 * cell + cell / 2, y: o.y + 12 * cell + cell / 2 });
+      // Bottom row (right→left)
+      for (let i = 0; i < 6; i++) pts.push({ x: o.x + (12 - i) * cell + cell / 2, y: o.y + 12 * cell + cell / 2 });
+      // Left column bottom part
+      for (let i = 0; i < 2; i++) pts.push({ x: o.x + 6 * cell + cell / 2, y: o.y + (13 + i) * cell + cell / 2 });
+      // Bottom left stretch
+      for (let i = 0; i < 6; i++) pts.push({ x: o.x + (6 - i) * cell + cell / 2, y: o.y + 14 * cell + cell / 2 });
+      // Left column (bottom→top)
+      for (let i = 0; i < 6; i++) pts.push({ x: o.x + 0 * cell + cell / 2, y: o.y + (12 - i) * cell + cell / 2 });
+      pts.push({ x: o.x + 0 * cell + cell / 2, y: o.y + 6 * cell + cell / 2 });
+      // Top row left part (left→right remaining)
+      for (let i = 0; i < 5; i++) pts.push({ x: o.x + (1 + i) * cell + cell / 2, y: o.y + 6 * cell + cell / 2 });
+      // Fill to 52 if short
+      while (pts.length < 52) {
+        pts.push(pts[pts.length - 1] || { x: o.x + s / 2, y: o.y + s / 2 });
+      }
+      return pts.slice(0, 52);
+    }
+
+    // Home column positions (6 cells into center for each player)
+    function homeColXY(player, step) {
+      // step 0-5
+      const s = boardSize();
+      const o = boardOrigin();
+      const cell = s / 15;
+      const cx = o.x + 7.5 * cell;
+      const cy = o.y + 7.5 * cell;
+      if (player === 0) return { x: cx, y: o.y + (13 - step) * cell + cell / 2 }; // red from bottom
+      if (player === 1) return { x: o.x + (1 + step) * cell + cell / 2, y: cy }; // green from left
+      if (player === 2) return { x: cx, y: o.y + (1 + step) * cell + cell / 2 }; // yellow from top
+      return { x: o.x + (13 - step) * cell + cell / 2, y: cy }; // blue from right
+    }
+
+    function yardXY(player, tokenIdx) {
+      const s = boardSize();
+      const o = boardOrigin();
+      const cell = s / 15;
+      const bases = [
+        { x: 1.5, y: 10.5 }, // red bottom-left
+        { x: 1.5, y: 1.5 },  // green top-left
+        { x: 10.5, y: 1.5 }, // yellow top-right
+        { x: 10.5, y: 10.5 } // blue bottom-right
+      ];
+      const b = bases[player];
+      const ox = (tokenIdx % 2) * 1.2;
+      const oy = Math.floor(tokenIdx / 2) * 1.2;
+      return {
+        x: o.x + (b.x + ox) * cell + cell / 2,
+        y: o.y + (b.y + oy) * cell + cell / 2
+      };
+    }
+
+    function tokenPixel(p, t) {
+      const tok = tokens[p][t];
+      if (tok.pos === -1) return yardXY(p, t);
+      if (tok.pos >= 100 && tok.pos < 106) return homeColXY(p, tok.pos - 100);
+      if (tok.pos === 999) {
+        const s = boardSize();
+        const o = boardOrigin();
+        return { x: o.x + boardSize() / 2, y: o.y + boardSize() / 2 };
+      }
+      // main path: map player-relative to global
+      const global = (START[p] + tok.pos) % 52;
+      return pathToXY(global);
+    }
+
+    function movableTokens(player, roll) {
+      const list = [];
+      for (let t = 0; t < 4; t++) {
+        const pos = tokens[player][t].pos;
+        if (pos === 999) continue;
+        if (pos === -1) {
+          if (roll === 6) list.push(t);
+        } else if (pos >= 100) {
+          // home column
+          const step = pos - 100;
+          if (step + roll <= 5) list.push(t);
+        } else {
+          // on path
+          const next = pos + roll;
+          if (next < 51) list.push(t);
+          else if (next === 51) list.push(t); // enter home stretch start
+          else if (next > 51 && next <= 56) list.push(t); // can enter home
+        }
+      }
+      return list;
+    }
+
+    function moveToken(player, tIdx, roll) {
+      const tok = tokens[player][tIdx];
+      if (tok.pos === -1 && roll === 6) {
+        tok.pos = 0; // enter board at start
+      } else if (tok.pos >= 0 && tok.pos < 51) {
+        let next = tok.pos + roll;
+        if (next < 51) {
+          tok.pos = next;
+        } else {
+          // enter home column
+          const over = next - 51;
+          tok.pos = 100 + over;
+          if (tok.pos > 105) tok.pos = 999;
+        }
+      } else if (tok.pos >= 100 && tok.pos <= 105) {
+        tok.pos += roll;
+        if (tok.pos > 105) tok.pos = 999;
+      }
+
+      // capture check (only on main path)
+      if (tok.pos >= 0 && tok.pos < 51) {
+        const global = (START[player] + tok.pos) % 52;
+        if (!SAFE.has(global)) {
+          for (let op = 0; op < numPlayers; op++) {
+            if (op === player) continue;
+            for (let ot = 0; ot < 4; ot++) {
+              const opp = tokens[op][ot];
+              if (opp.pos >= 0 && opp.pos < 51) {
+                const og = (START[op] + opp.pos) % 52;
+                if (og === global) {
+                  opp.pos = -1; // send home
+                  message = NAMES[op] + ' captured!';
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // win check
+      if (tokens[player].every(t => t.pos === 999)) {
+        winner = player;
+        phase = 'win';
+        running = false;
+        Hub.setScore(NAMES[player] + ' wins!');
+        Hub.showOverlay(
+          `<h2>${NAMES[player]} Wins!</h2><button class="btn-play" id="go">PLAY AGAIN</button>`
+        );
+        document.getElementById('go').onclick = () => showMenu();
+      }
+    }
+
+    function nextTurn(extra) {
+      selectedToken = -1;
+      if (extra) {
+        canRoll = true;
+        message = NAMES[current] + ' rolls again (6)';
+        return;
+      }
+      current = (current + 1) % numPlayers;
+      canRoll = true;
+      message = NAMES[current] + "'s turn — roll dice";
+      Hub.setScore(NAMES[current] + ' · Roll');
+    }
+
+    function rollDice() {
+      if (!canRoll || diceRolling || phase !== 'play') return;
+      diceRolling = true;
+      canRoll = false;
+      let n = 0;
+      const iv = setInterval(() => {
+        dice = 1 + Math.floor(Math.random() * 6);
+        n++;
+        if (n > 10) {
+          clearInterval(iv);
+          diceRolling = false;
+          onDiceResult(dice);
+        }
+      }, 60);
+    }
+
+    function onDiceResult(roll) {
+      const moves = movableTokens(current, roll);
+      if (moves.length === 0) {
+        message = 'No moves — next player';
+        setTimeout(() => nextTurn(false), 700);
+        return;
+      }
+      if (moves.length === 1) {
+        moveToken(current, moves[0], roll);
+        nextTurn(roll === 6);
+      } else {
+        selectedToken = -1;
+        message = 'Tap a token to move (' + roll + ')';
+        // store pending roll
+        window._ludoPending = { roll, moves };
+      }
+    }
+
+    function trySelectToken(p, t) {
+      if (phase !== 'play' || p !== current) return;
+      const pending = window._ludoPending;
+      if (!pending) return;
+      if (!pending.moves.includes(t)) return;
+      moveToken(p, t, pending.roll);
+      window._ludoPending = null;
+      nextTurn(pending.roll === 6);
+    }
+
+    function showMenu() {
+      phase = 'menu';
+      winner = null;
+      message = '';
+      window._ludoPending = null;
+      Hub.setScore('Ludo');
+      Hub.showOverlay(`
+        <h2>Ludo</h2>
+        <p>Select players</p>
+        <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin:12px 0">
+          <button class="btn-play" id="p2" style="min-width:80px">2P</button>
+          <button class="btn-play" id="p3" style="min-width:80px">3P</button>
+          <button class="btn-play" id="p4" style="min-width:80px">4P</button>
+        </div>
+      `);
+      document.getElementById('p2').onclick = () => startGame(2);
+      document.getElementById('p3').onclick = () => startGame(3);
+      document.getElementById('p4').onclick = () => startGame(4);
+    }
+
+    function startGame(n) {
+      numPlayers = n;
+      initTokens();
+      current = 0;
+      dice = 1;
+      canRoll = true;
+      selectedToken = -1;
+      phase = 'play';
+      running = true;
+      message = NAMES[0] + "'s turn — roll dice";
+      Hub.hideOverlay();
+      Hub.setScore(NAMES[0] + ' · Roll');
+      Hub.showPads({
+        left: [],
+        right: [[{ id: 'Space', label: '🎲 ROLL', wide: true }]]
+      });
+    }
+
+    // Input
+    let spaceWas = false;
+    canvas.addEventListener('pointerdown', e => {
+      e.preventDefault();
+      if (phase !== 'play') return;
+      const rect = canvas.getBoundingClientRect();
+      const mx = (e.clientX - rect.left) * (canvas.width / rect.width);
+      const my = (e.clientY - rect.top) * (canvas.height / rect.height);
+
+      // dice button area (bottom center)
+      const s = boardSize();
+      const o = boardOrigin();
+      const diceX = o.x + s / 2;
+      const diceY = o.y + s + 8;
+      if (Math.hypot(mx - diceX, my - (Math.min(h - 30, diceY))) < 36) {
+        rollDice();
+        return;
+      }
+
+      // token hit
+      for (let p = 0; p < numPlayers; p++) {
+        for (let t = 0; t < 4; t++) {
+          const pt = tokenPixel(p, t);
+          if (Math.hypot(mx - pt.x, my - pt.y) < boardSize() / 30) {
+            trySelectToken(p, t);
+            return;
+          }
+        }
+      }
+    });
+
+    function loop() {
+      animId = requestAnimationFrame(loop);
+      // virtual roll button
+      const spaceNow = typeof Input !== 'undefined' && Input.on('Space');
+      if (spaceNow && !spaceWas) rollDice();
+      spaceWas = spaceNow;
+
+      ctx.fillStyle = '#0a0a12';
+      ctx.fillRect(0, 0, w, h);
+      if (phase === 'menu') return;
+
+      const s = boardSize();
+      const o = boardOrigin();
+      const cell = s / 15;
+
+      // board background
+      ctx.fillStyle = '#1a1a28';
+      roundRect(ctx, o.x, o.y, s, s, 8);
+      ctx.fill();
+
+      // 4 home yards
+      const yards = [
+        { x: 0, y: 9, c: COLORS[0] },
+        { x: 0, y: 0, c: COLORS[1] },
+        { x: 9, y: 0, c: COLORS[2] },
+        { x: 9, y: 9, c: COLORS[3] }
+      ];
+      yards.forEach((y, i) => {
+        if (i >= numPlayers) {
+          ctx.fillStyle = '#222230';
+        } else {
+          ctx.fillStyle = y.c + '44';
+        }
+        ctx.fillRect(o.x + y.x * cell, o.y + y.y * cell, 6 * cell, 6 * cell);
+        ctx.strokeStyle = i < numPlayers ? y.c : '#333';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(o.x + y.x * cell + 2, o.y + y.y * cell + 2, 6 * cell - 4, 6 * cell - 4);
+      });
+
+      // center cross paths (light)
+      ctx.fillStyle = '#2a2a3a';
+      ctx.fillRect(o.x + 6 * cell, o.y, 3 * cell, s);
+      ctx.fillRect(o.x, o.y + 6 * cell, s, 3 * cell);
+
+      // colored home columns
+      const hc = [
+        { x: 7, y: 9, w: 1, h: 6, c: COLORS[0] },
+        { x: 1, y: 7, w: 6, h: 1, c: COLORS[1] },
+        { x: 7, y: 1, w: 1, h: 6, c: COLORS[2] },
+        { x: 9, y: 7, w: 6, h: 1, c: COLORS[3] }
+      ];
+      hc.forEach((c, i) => {
+        if (i < numPlayers) {
+          ctx.fillStyle = c.c + '66';
+          ctx.fillRect(o.x + c.x * cell, o.y + c.y * cell, c.w * cell, c.h * cell);
+        }
+      });
+
+      // center triangle / home
+      ctx.fillStyle = '#111118';
+      ctx.beginPath();
+      ctx.moveTo(o.x + 6 * cell, o.y + 6 * cell);
+      ctx.lineTo(o.x + 9 * cell, o.y + 6 * cell);
+      ctx.lineTo(o.x + 9 * cell, o.y + 9 * cell);
+      ctx.lineTo(o.x + 6 * cell, o.y + 9 * cell);
+      ctx.closePath();
+      ctx.fill();
+
+      // grid lines subtle
+      ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+      ctx.lineWidth = 1;
+      for (let i = 0; i <= 15; i++) {
+        ctx.beginPath();
+        ctx.moveTo(o.x + i * cell, o.y);
+        ctx.lineTo(o.x + i * cell, o.y + s);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(o.x, o.y + i * cell);
+        ctx.lineTo(o.x + s, o.y + i * cell);
+        ctx.stroke();
+      }
+
+      // path dots
+      for (let i = 0; i < 52; i++) {
+        const pt = pathToXY(i);
+        ctx.fillStyle = SAFE.has(i) ? 'rgba(255,255,255,0.25)' : 'rgba(255,255,255,0.08)';
+        ctx.beginPath();
+        ctx.arc(pt.x, pt.y, cell * 0.2, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      // tokens
+      for (let p = 0; p < numPlayers; p++) {
+        for (let t = 0; t < 4; t++) {
+          const pt = tokenPixel(p, t);
+          const r = cell * 0.32;
+          ctx.beginPath();
+          ctx.arc(pt.x, pt.y, r, 0, Math.PI * 2);
+          ctx.fillStyle = COLORS[p];
+          ctx.shadowColor = COLORS[p];
+          ctx.shadowBlur = 8;
+          ctx.fill();
+          ctx.shadowBlur = 0;
+          ctx.strokeStyle = '#fff';
+          ctx.lineWidth = 2;
+          ctx.stroke();
+          // number
+          ctx.fillStyle = '#fff';
+          ctx.font = 'bold ' + Math.floor(r) + 'px sans-serif';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(String(t + 1), pt.x, pt.y + 1);
+        }
+      }
+
+      // dice
+      const diceX = o.x + s / 2;
+      const diceY = Math.min(h - 28, o.y + s + 24);
+      ctx.fillStyle = '#fff';
+      ctx.shadowColor = '#22d3ee';
+      ctx.shadowBlur = canRoll ? 12 : 0;
+      roundRect(ctx, diceX - 22, diceY - 22, 44, 44, 8);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = '#111';
+      ctx.font = 'bold 22px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(String(dice), diceX, diceY);
+
+      // message
+      ctx.fillStyle = '#94a3b8';
+      ctx.font = '13px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(message || '', w / 2, 18);
+
+      // current player indicator
+      if (phase === 'play') {
+        ctx.fillStyle = COLORS[current];
+        ctx.beginPath();
+        ctx.arc(16, 18, 8, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    function roundRect(ctx, x, y, w, h, r) {
+      ctx.beginPath();
+      ctx.moveTo(x + r, y);
+      ctx.arcTo(x + w, y, x + w, y + h, r);
+      ctx.arcTo(x + w, y + h, x, y + h, r);
+      ctx.arcTo(x, y + h, x, y, r);
+      ctx.arcTo(x, y, x + w, y, r);
+      ctx.closePath();
+    }
+
+    showMenu();
+    loop();
+
+    this._cleanup = () => {
+      running = false;
+      cancelAnimationFrame(animId);
+      window.removeEventListener('resize', resize);
+      if (typeof Hub !== 'undefined') Hub.hidePads();
+      window._ludoPending = null;
+    };
+  },
+  stop() {
+    if (this._cleanup) this._cleanup();
+  }
+});
+
 /* Boot */
 Hub.init();
 </script>
